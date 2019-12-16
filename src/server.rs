@@ -7,7 +7,6 @@ use std::thread;
 
 use http::{self, Method, StatusCode};
 use tokio::net::TcpListener;
-use tokio::reactor::Handle;
 use warp::{self, Buf, Filter, Rejection};
 
 use crate::command::{WebDriverCommand, WebDriverMessage};
@@ -178,9 +177,11 @@ where
 
     let builder = thread::Builder::new().name("webdriver server".to_string());
     let handle = builder.spawn(move || {
-        let listener = TcpListener::from_std(listener, &Handle::default()).unwrap();
+        let mut listener = TcpListener::from_std(listener).unwrap();
         let wroutes = build_warp_routes(&extension_routes, msg_send.clone());
-        warp::serve(wroutes).run_incoming(listener.incoming());
+        tokio::spawn(async move {
+            warp::serve(wroutes).run_incoming(listener.incoming()).await
+        });
     })?;
 
     let builder = thread::Builder::new().name("webdriver dispatcher".to_string());
@@ -232,11 +233,11 @@ fn build_route<U: 'static + WebDriverExtensionRoute + Send + Sync>(
     // Create an empty filter based on the provided method and append an empty hashmap to it. The
     // hashmap will be used to store path parameters.
     let mut subroute = match method {
-        Method::GET => warp::get2().boxed(),
-        Method::POST => warp::post2().boxed(),
-        Method::DELETE => warp::delete2().boxed(),
+        Method::GET => warp::get().boxed(),
+        Method::POST => warp::post().boxed(),
+        Method::DELETE => warp::delete().boxed(),
         Method::OPTIONS => warp::options().boxed(),
-        Method::PUT => warp::put2().boxed(),
+        Method::PUT => warp::put().boxed(),
         _ => panic!("Unsupported method"),
     }
     .or(warp::head())
@@ -277,7 +278,7 @@ fn build_route<U: 'static + WebDriverExtensionRoute + Send + Sync>(
                 if method == Method::HEAD {
                     return warp::reply::with_status("".into(), StatusCode::OK);
                 }
-                let body = String::from_utf8(body.collect::<Vec<u8>>());
+                let body = String::from_utf8(body.bytes().to_vec());
                 if body.is_err() {
                     return warp::reply::with_status(
                         "The body wasn't valid UTF-8".to_string(),
@@ -327,11 +328,11 @@ fn build_route<U: 'static + WebDriverExtensionRoute + Send + Sync>(
             },
         )
         .with(warp::reply::with::header(
-            http::header::CONTENT_TYPE,
+            warp::http::header::CONTENT_TYPE,
             "application/json; charset=utf-8",
         ))
         .with(warp::reply::with::header(
-            http::header::CACHE_CONTROL,
+            warp::http::header::CACHE_CONTROL,
             "no-cache",
         ))
         .boxed()
