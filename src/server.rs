@@ -5,6 +5,7 @@ use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
+use bytes::Bytes;
 use http::{self, Method, StatusCode};
 use tokio::net::TcpListener;
 use warp::{self, Buf, Filter, Rejection};
@@ -177,11 +178,17 @@ where
 
     let builder = thread::Builder::new().name("webdriver server".to_string());
     let handle = builder.spawn(move || {
-        let mut listener = TcpListener::from_std(listener).unwrap();
+        let mut rt = tokio::runtime::Builder::new()
+            .basic_scheduler()
+            .enable_io()
+            .build()
+            .unwrap();
+        let mut listener = rt
+            .handle()
+            .enter(|| TcpListener::from_std(listener).unwrap());
         let wroutes = build_warp_routes(&extension_routes, msg_send.clone());
-        tokio::spawn(async move {
-            warp::serve(wroutes).run_incoming(listener.incoming()).await
-        });
+        let fut = warp::serve(wroutes).run_incoming(listener.incoming());
+        rt.block_on(fut);
     })?;
 
     let builder = thread::Builder::new().name("webdriver dispatcher".to_string());
@@ -199,7 +206,7 @@ where
 fn build_warp_routes<U: 'static + WebDriverExtensionRoute + Send + Sync>(
     ext_routes: &[(Method, &'static str, U)],
     chan: Sender<DispatchMessage<U>>,
-) -> impl Filter<Extract = impl warp::Reply, Error = Rejection> {
+) -> impl Filter<Extract = impl warp::Reply, Error = Rejection> + Clone {
     let chan = Arc::new(Mutex::new(chan));
     let mut std_routes = standard_routes::<U>();
     let (method, path, res) = std_routes.pop().unwrap();
@@ -272,9 +279,9 @@ fn build_route<U: 'static + WebDriverExtensionRoute + Send + Sync>(
         .and(warp::path::end())
         .and(warp::path::full())
         .and(warp::method())
-        .and(warp::body::concat())
+        .and(warp::body::bytes())
         .map(
-            move |params, full_path: warp::path::FullPath, method, body: warp::body::FullBody| {
+            move |params, full_path: warp::path::FullPath, method, body: Bytes| {
                 if method == Method::HEAD {
                     return warp::reply::with_status("".into(), StatusCode::OK);
                 }
@@ -328,11 +335,11 @@ fn build_route<U: 'static + WebDriverExtensionRoute + Send + Sync>(
             },
         )
         .with(warp::reply::with::header(
-            warp::http::header::CONTENT_TYPE,
+            http::header::CONTENT_TYPE,
             "application/json; charset=utf-8",
         ))
         .with(warp::reply::with::header(
-            warp::http::header::CACHE_CONTROL,
+            http::header::CACHE_CONTROL,
             "no-cache",
         ))
         .boxed()
